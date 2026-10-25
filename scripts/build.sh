@@ -7,7 +7,7 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-"$ROOT/build"}
-TARGET=${IOS_TARGET:-arm64e-apple-ios17.0}
+TARGET=${IOS_TARGET:-arm64e-apple-ios18.0}
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 CXXFLAGS="-std=c++17 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -Wno-deprecated-declarations"
 INCLUDES="-I$ROOT/frontend -I$ROOT/frontend/bridge -I$ROOT/wire -I$ROOT/include"
@@ -21,7 +21,7 @@ cd "$ROOT"
 xcrun clang++ $IOS $CXXFLAGS $INCLUDES -c remote/QemuMetalRemote.cpp -o "$OUT/QemuMetalRemote.o"
 xcrun clang++ $IOS $CXXFLAGS -fobjc-arc $INCLUDES \
     frontend/NativeBridgeMetalFrontend.mm plugin/DarwinMetalPlugin.mm remote/QemuMetalLibraries.mm remote/QemuMetalGaps.mm \
-    "$OUT/QemuMetalRemote.o" -bundle -Wl,-dead_strip -lobjc \
+    "$OUT/QemuMetalRemote.o" -bundle -Wl,-dead_strip \
     -framework Foundation -framework Metal -framework IOSurface -framework CoreFoundation \
     -o "$OUT/QemuMetal.bundle/QemuMetal"
 xcrun strip -x "$OUT/QemuMetal.bundle/QemuMetal"
@@ -32,7 +32,7 @@ xcrun strip -x "$OUT/QemuMetal.bundle/QemuMetal"
     -c 'Add :CFBundleVersion string 1' \
     -c 'Add :CFBundleShortVersionString string 1' \
     -c 'Add :NSPrincipalClass string QemuMetalDevice' \
-    -c 'Add :MinimumOSVersion string 17.0' \
+    -c 'Add :MinimumOSVersion string 18.0' \
     "$OUT/QemuMetal.bundle/Info.plist" >/dev/null
 
 xcrun clang++ $IOS $CXXFLAGS -fobjc-arc tools/guest-metal-check.mm -framework Foundation -framework Metal \

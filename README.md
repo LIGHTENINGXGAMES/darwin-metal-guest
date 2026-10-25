@@ -42,4 +42,4 @@ The first commit holds the upstream files verbatim; later commits are the darwin
 
 ## Build locally
 
-On macOS with Xcode: `sh scripts/build.sh build`. `IOS_TARGET` overrides the target triple (default `arm64e-apple-ios17.0`).
+On macOS with Xcode: `sh scripts/build.sh build`. `IOS_TARGET` overrides the target triple (default `arm64e-apple-ios18.0`).
