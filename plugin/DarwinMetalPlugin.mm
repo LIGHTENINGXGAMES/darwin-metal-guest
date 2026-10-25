@@ -79,8 +79,11 @@ bool attach(void *slotBase, uint64_t slotBytes, volatile uint32_t *registers, un
         NSLog(@"QemuMetal: the register page is not the darwin machine's");
         return false;
     }
-    const darwin_metal_slot_record record = *static_cast<const volatile darwin_metal_slot_record *>(slotBase);
-    if (record.magic != DARWIN_METAL_SLOT_MAGIC || record.slot >= DARWIN_METAL_SLOTS || record.bytes != slotBytes) {
+    // Field by field: C++ copies no volatile structure.
+    const volatile darwin_metal_slot_record *record = static_cast<const volatile darwin_metal_slot_record *>(slotBase);
+    const uint32_t magic = record->magic, number = record->slot;
+    const uint64_t bytes = record->bytes;
+    if (magic != DARWIN_METAL_SLOT_MAGIC || number >= DARWIN_METAL_SLOTS || bytes != slotBytes) {
         NSLog(@"QemuMetal: no slot record from the kernel");
         return false;
     }
@@ -88,7 +91,7 @@ bool attach(void *slotBase, uint64_t slotBytes, volatile uint32_t *registers, un
         NSLog(@"QemuMetal: no host process serves the window; keeping the software renderer");
         return false;
     }
-    *slot = record.slot;
+    *slot = number;
     return true;
 }
 
