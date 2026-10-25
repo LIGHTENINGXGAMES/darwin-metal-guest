@@ -30,7 +30,7 @@ maps. Without a serving host the plugin returns nil and the process keeps the so
 | `frontend/` | [UniXNU/AdrenoMetal](https://github.com/UniXNU/AdrenoMetal) 454ff2c, unchanged | MIT |
 | `wire/`, `remote/` | [xVanTuring/UniXNU-qemu](https://github.com/xVanTuring/UniXNU-qemu) 97b75b1 `package/QemuMetal` | BSD-2-Clause-Patent |
 | `plugin/` | adapted from UniXNU-qemu's `QemuMetalPlugin.mm` | BSD-2-Clause-Patent |
-| `include/darwin_metal.h` | the darwin machine's `qemu-sptm/include/hw/arm/darwin_metal.h` | QEMU's (GPL-2.0-or-later) |
+| `include/darwin_metal.h` | copy of the darwin machine's `qemu-sptm/include/hw/arm/darwin_metal.h` (interface constants and layouts) | as in that tree |
 | `tools/`, `scripts/` | this repository | BSD-2-Clause-Patent |
 
 The first commit holds the upstream files verbatim; later commits are the darwin adaptations:
