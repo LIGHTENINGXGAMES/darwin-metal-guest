@@ -87,6 +87,8 @@ enum QMOp {
     QM_STITCHED_LIBRARY,         // QMStitched, its function handles, its graphs -> handle, uint64_t count, then the names (QM_LIBRARY's)
     QM_EXTERN_NAMES,             // uint64_t library -> uint64_t count, then count NUL-terminated names (externFunctionNames)
     QM_SOURCE_LIBRARY,           // QMSource, then its macros -> handle, uint64_t count, then the names (QM_LIBRARY's)
+    // Darwin-only extension, negotiated by QMDeviceFeatures after QMDeviceInfo.
+    QM_DISPLAY_SURFACE = 4096,    // QMDisplaySurface -> handle, QMTextureDescriptor; GPU-only display image
 };
 enum {QM_FAILED = -1, QM_UNKNOWN = -2, QM_NOT_FOUND = -3};   // QM_NOT_FOUND: a function name the library has not (its text is Metal's)
 
@@ -96,6 +98,8 @@ struct QMDeviceInfo {
     uint64_t maxBufferLength, maxThreads[3];
     uint64_t heapAddress;                    // the GPU address of the window's heap on the Mac (buffers' gpuAddress)
 };
+#define QM_FEATURE_DISPLAY_SURFACE (1ull << 0)
+struct QMDeviceFeatures {uint64_t bits;}; // optional suffix of QM_OPEN's reply; absence means no extensions
 struct QMAnswer {uint64_t known, value;};
 struct QMAnswerRequest {char selector[96]; uint64_t argument;};
 struct QMHandleValue {uint64_t handle, value;};
@@ -103,6 +107,12 @@ struct QMTextureDescriptor {uint64_t type, format, width, height, depth, levels,
 struct QMTexture {QMTextureDescriptor descriptor;};
 // A linear texture over window bytes: a buffer (offset is the window's) or the shadow of an IOSurface.
 struct QMTextureOnBuffer {QMTextureDescriptor descriptor; uint64_t offset, bytesPerRow, bytesPerImage, surface;};
+// Nonplanar full-screen RGBA16Float only. offset and allocationLength describe the reserved
+// shadow range, not CPU-visible texture storage. The host owns the live pixels after success.
+struct QMDisplaySurface {QMTextureDescriptor descriptor; uint64_t offset, bytesPerRow, allocationLength, surfaceID, plane;};
+static_assert(sizeof(QMDeviceInfo) == 136 && sizeof(QMDeviceFeatures) == 8 &&
+              sizeof(QMTextureDescriptor) == 80 && sizeof(QMDisplaySurface) == 120,
+              "Darwin display-surface wire layout");
 struct QMTextureView {uint64_t texture, format, kind, levels[2], slices[2], whole;};
 // The texture region (x, y, z, width, height, depth), its level and slice, and the window's staging bytes in rows.
 struct QMTextureBytes {uint64_t texture, region[6], level, slice, offset, bytesPerRow, bytesPerImage, length;};

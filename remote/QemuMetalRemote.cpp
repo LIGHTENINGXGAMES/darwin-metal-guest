@@ -207,17 +207,22 @@ struct Staging {
 // ---- objects ----
 struct NmbDevice {
     QMDeviceInfo info;
+    uint64_t features = 0;
     std::vector<std::pair<std::string, uint32_t>> selectors;
     std::unordered_map<std::string, uint64_t> answers;
     std::mutex answerLock;
     std::map<std::pair<std::string, uint64_t>, uint64_t> argumentAnswers;
 };
 struct NmbHeap {uint64_t type, size, options, used = 0;};
+enum class BufferBacking { Unused, Shadow, DisplaySurface };
 struct NmbBuffer {
     uint64_t offset = 0, length = 0, allocation = 0;
     void *guest = nullptr;                     // newBufferWithBytesNoCopy / an IOSurface: the caller's memory; offset is its shadow
     NmbHeap *heap = nullptr;
     Release release = {};                      // the caller's deallocator for guest
+    mutable std::mutex backingLock;
+    mutable BufferBacking backing = BufferBacking::Unused;
+    uint32_t surfaceID = 0;
 };
 struct NmbTexture {
     uint64_t handle = 0;
@@ -270,8 +275,14 @@ std::vector<NmbCommandBuffer *> gToSchedule;
 struct Notify {NmbEvent *event; uint64_t value; void (*handler)(void *, uint64_t); void *context;};
 std::vector<Notify> gNotifies;
 
-void copyIn(NmbBuffer *buffer) {memcpy(gWindow + buffer->offset, buffer->guest, buffer->length);}
-void copyOut(NmbBuffer *buffer) {memcpy(buffer->guest, gWindow + buffer->offset, buffer->length);}
+void copyIn(NmbBuffer *buffer) {
+    std::lock_guard<std::mutex> lock(buffer->backingLock);
+    if (buffer->backing != BufferBacking::DisplaySurface) memcpy(gWindow + buffer->offset, buffer->guest, buffer->length);
+}
+void copyOut(NmbBuffer *buffer) {
+    std::lock_guard<std::mutex> lock(buffer->backingLock);
+    if (buffer->backing != BufferBacking::DisplaySurface) memcpy(buffer->guest, gWindow + buffer->offset, buffer->length);
+}
 // The frontend's handlers run on a queue of their own, in order (scheduled before completed): the completion thread never runs the OS's
 // code, so a handler waiting on a lock the committing thread holds cannot stop the completion that thread waits for.
 dispatch_queue_t gHandlers;
@@ -486,6 +497,15 @@ QMTextureDescriptor wire(const NmbTextureDescriptor *d) {
 }
 // The window offset of a buffer's bytes at offset.
 uint64_t at(const NmbBuffer *buffer, uint64_t offset) {return buffer ? buffer->offset + offset : QM_NONE;}
+// Exposing raw window bytes commits an import to that storage model. It cannot later become
+// an unrelated Private image, and a display image must never masquerade as its stale shadow.
+bool shadowBuffer(const NmbBuffer *buffer) {
+    if (!buffer) return true;
+    std::lock_guard<std::mutex> lock(buffer->backingLock);
+    if (buffer->backing == BufferBacking::DisplaySurface) return fail("GPU-only display surface has no buffer alias");
+    buffer->backing = BufferBacking::Shadow;
+    return true;
+}
 
 // ---- recording ----
 bool emit(NmbCommandBuffer *commandBuffer, uint32_t op, const void *fields, size_t bytes, const void *extra = nullptr, size_t extraBytes = 0) {
@@ -662,6 +682,8 @@ NmbDevice *nmb_device_open(const char *loader, const char *cache) {
     store(&control()->completionsRead, 0);
     NmbDevice *device = new NmbDevice;
     memcpy(&device->info, reply.data.data(), sizeof device->info);
+    if (reply.data.size() >= sizeof(QMDeviceInfo) + sizeof(QMDeviceFeatures))
+        memcpy(&device->features, reply.data.data() + sizeof(QMDeviceInfo), sizeof device->features);
     askAnswers(device);
     gDevice = device;
     gHandlers = dispatch_queue_create("qemu-metal handlers", DISPATCH_QUEUE_SERIAL);
@@ -768,10 +790,17 @@ void nmb_buffer_release(NmbBuffer *buffer) {
     deallocateLater(buffer->offset, buffer->allocation, buffer->release);
     delete buffer;
 }
-void *nmb_buffer_contents(const NmbBuffer *buffer) {return buffer ? (buffer->guest ? buffer->guest : gWindow + buffer->offset) : nullptr;}
+void *nmb_buffer_contents(const NmbBuffer *buffer) {
+    return buffer && shadowBuffer(buffer) ? (buffer->guest ? buffer->guest : gWindow + buffer->offset) : nullptr;
+}
+bool nmb_buffer_is_display_surface(const NmbBuffer *buffer) {
+    if (!buffer) return false;
+    std::lock_guard<std::mutex> lock(buffer->backingLock);
+    return buffer->backing == BufferBacking::DisplaySurface;
+}
 uint64_t nmb_buffer_length(const NmbBuffer *buffer) {return buffer ? buffer->length : 0;}
 uint64_t nmb_buffer_gpu_address(const NmbBuffer *buffer) {
-    return buffer && gDevice ? gDevice->info.heapAddress + (buffer->offset - QM_HEAP) : 0;
+    return buffer && gDevice && shadowBuffer(buffer) ? gDevice->info.heapAddress + (buffer->offset - QM_HEAP) : 0;
 }
 // Nothing here is ever purged: the answer is MTLPurgeableStateNonVolatile.
 uint64_t nmb_buffer_set_purgeable_state(const NmbBuffer *, uint64_t) {return 2;}
@@ -825,13 +854,48 @@ static NmbTexture *textureOnBuffer(NmbBuffer *buffer, const struct NmbTextureDes
                                    uint64_t bytesPerImage, bool surface) {
     if (!buffer || !descriptor) return refuse<NmbTexture>("no buffer or descriptor");
     if (offset >= buffer->length) return refuse<NmbTexture>("texture offset past the buffer");
+    std::lock_guard<std::mutex> lock(buffer->backingLock);
+    if (buffer->backing == BufferBacking::DisplaySurface) return refuse<NmbTexture>("GPU-only display surface cannot acquire a shadow texture alias");
     const QMTextureOnBuffer request = {wire(descriptor), buffer->offset + offset, bytesPerRow, bytesPerImage, surface};
     Reply reply;
-    return call(QM_TEXTURE_ON_BUFFER, request, reply) ? textureReply(reply, buffer->guest ? buffer : nullptr) : nullptr;
+    NmbTexture *texture = call(QM_TEXTURE_ON_BUFFER, request, reply) ? textureReply(reply, buffer->guest ? buffer : nullptr) : nullptr;
+    if (texture) buffer->backing = BufferBacking::Shadow;
+    return texture;
 }
 NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *buffer, const struct NmbTextureDescriptor *descriptor, uint64_t offset, uint64_t bytes_per_row,
                                       bool iosurface) {
     return textureOnBuffer(buffer, descriptor, offset, bytes_per_row, 0, iosurface);
+}
+NmbTexture *nmb_texture_new_display_surface(NmbBuffer *buffer, const struct NmbTextureDescriptor *descriptor, uint64_t offset,
+                                           uint64_t bytes_per_row, uint32_t surface_id) {
+    // Metal's raw values: Texture2D=2, RGBA16Float=115. This extension does not cover
+    // planes, reinterpretations, mip chains, multisampling or arbitrary caller buffers.
+    if (!gDevice || !(gDevice->features & QM_FEATURE_DISPLAY_SURFACE) || !descriptor ||
+        descriptor->type != 2 || descriptor->format != 115 || descriptor->width != 1080 || descriptor->height != 2400 ||
+        descriptor->depth != 1 || descriptor->levels != 1 || descriptor->samples != 1 || descriptor->array_length != 1)
+        return textureOnBuffer(buffer, descriptor, offset, bytes_per_row, 0, true);
+    if (!buffer || !buffer->guest || !surface_id || offset >= buffer->length || bytes_per_row < 1080 * 8 ||
+        (bytes_per_row & 1) || bytes_per_row > (buffer->length - offset) / 2400)
+        return refuse<NmbTexture>("invalid display surface allocation, identity or stride");
+    std::lock_guard<std::mutex> lock(buffer->backingLock);
+    if (buffer->backing == BufferBacking::Shadow)
+        return refuse<NmbTexture>("display surface already has a CPU or shadow buffer alias");
+    if (buffer->backing == BufferBacking::DisplaySurface && buffer->surfaceID != surface_id)
+        return refuse<NmbTexture>("display surface identity changed for a live import");
+    // Preserve initial CPU texels once. The host uploads them only if this global surface
+    // identity has no live GPU image; later imports must not replace its newer GPU contents.
+    // backingLock is already held, so do not recursively enter copyIn here.
+    if (buffer->backing == BufferBacking::Unused) memcpy(gWindow + buffer->offset, buffer->guest, buffer->length);
+    const QMDisplaySurface request = {wire(descriptor), buffer->offset + offset, bytes_per_row,
+                                     buffer->length - offset, surface_id, 0};
+    Reply reply;
+    if (!call(QM_DISPLAY_SURFACE, request, reply)) return nullptr;
+    NmbTexture *texture = textureReply(reply, buffer);
+    if (texture) {
+        buffer->surfaceID = surface_id;
+        buffer->backing = BufferBacking::DisplaySurface;
+    }
+    return texture;
 }
 // Planar IOSurfaces (video, camera) have no shadow layout on the wire yet; the frontend reports the refusal.
 NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t, uint64_t, uint32_t pixel_format,
@@ -1280,6 +1344,7 @@ bool nmb_encoder_wait_fence(NmbEncoder *encoder, NmbFence *fence, uint64_t stage
 }
 bool nmb_encoder_set_buffer(NmbEncoder *encoder, uint32_t stage, NmbBuffer *buffer, uint64_t offset, uint32_t index) {
     if (!encoder || stage > 2 || index >= 31) return fail("bad buffer binding");
+    if (!shadowBuffer(buffer)) return false;
     encoder->bound[stage][index] = buffer;
     encoder->boundOffset[stage][index] = offset;
     // A compute function may write any buffer it is given.
@@ -1362,12 +1427,14 @@ bool nmb_render_draw(NmbEncoder *encoder, uint64_t primitive, uint32_t start, ui
 bool nmb_render_draw_indexed(NmbEncoder *encoder, uint64_t primitive, uint32_t count, uint64_t index_type, NmbBuffer *indices, uint64_t offset,
                              uint32_t instances, int32_t base_vertex, uint32_t base_instance) {
     if (!encoder || !indices) return fail("no index buffer");
+    if (!shadowBuffer(indices)) return false;
     use(encoder->commandBuffer, indices, false);
     return emit(encoder, QC_DRAW_INDEXED, QCDrawIndexed{primitive, count, index_type, at(indices, offset), instances, base_vertex, base_instance});
 }
 bool nmb_blit_copy_buffer(NmbEncoder *encoder, NmbBuffer *source, uint64_t source_offset, NmbBuffer *destination, uint64_t destination_offset,
                           uint64_t size) {
     if (!encoder || !source || !destination) return fail("no buffer");
+    if (!shadowBuffer(source) || !shadowBuffer(destination)) return false;
     use(encoder->commandBuffer, source, false);
     use(encoder->commandBuffer, destination, true);
     const uint64_t fields[3] = {at(source, source_offset), at(destination, destination_offset), size};
@@ -1375,6 +1442,7 @@ bool nmb_blit_copy_buffer(NmbEncoder *encoder, NmbBuffer *source, uint64_t sourc
 }
 bool nmb_blit_fill_buffer(NmbEncoder *encoder, NmbBuffer *buffer, uint64_t start, uint64_t end, uint8_t value) {
     if (!encoder || !buffer || end < start) return fail("no buffer");
+    if (!shadowBuffer(buffer)) return false;
     use(encoder->commandBuffer, buffer, true);
     const uint64_t fields[3] = {at(buffer, start), end - start, value};
     return emit(encoder->commandBuffer, QC_FILL_BUFFER, fields, sizeof fields);
@@ -1394,6 +1462,7 @@ bool nmb_blit_copy_texture(NmbEncoder *encoder, NmbTexture *source, uint64_t sou
 static bool bufferTexture(NmbEncoder *encoder, uint32_t op, NmbBuffer *buffer, uint64_t offset, uint64_t bytesPerRow, uint64_t bytesPerImage,
                           const uint64_t size[3], NmbTexture *texture, uint64_t slice, uint64_t level, const uint64_t origin[3]) {
     if (!encoder || !buffer || !texture) return fail("no buffer or texture");
+    if (!shadowBuffer(buffer)) return false;
     use(encoder->commandBuffer, buffer, op == QC_TEXTURE_TO_BUFFER);
     use(encoder->commandBuffer, texture, op == QC_BUFFER_TO_TEXTURE);
     QCBufferTexture fields = {at(buffer, offset), bytesPerRow, bytesPerImage, {}, texture->handle, slice, level, {}};
