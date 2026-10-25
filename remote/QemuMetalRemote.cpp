@@ -39,6 +39,7 @@
 #include <vector>
 
 extern "C" void qemu_metal_set_window(void *base, uint64_t bytes);
+extern "C" void qemu_metal_set_doorbell(volatile void *doorbell, unsigned slot);
 extern "C" void qemu_metal_complete_frontend(void *device);
 
 namespace {
@@ -55,6 +56,13 @@ void pause(unsigned round) {
 
 unsigned char *gWindow;
 uint64_t gWindowBytes;
+// The darwin machine's doorbell register (include/darwin_metal.h): a write of the slot's number wakes the host at once. Without it the
+// host still finds each request within a millisecond.
+volatile uint32_t *gDoorbell;
+unsigned gSlotNumber;
+void ring() {
+    if (gDoorbell) *gDoorbell = gSlotNumber;
+}
 QMControl *control() {return reinterpret_cast<QMControl *>(gWindow + QM_CONTROL);}
 uint64_t load(const uint64_t *word) {return __atomic_load_n(word, __ATOMIC_ACQUIRE);}
 void store(uint64_t *word, uint64_t value) {__atomic_store_n(word, value, __ATOMIC_RELEASE);}
@@ -93,14 +101,25 @@ void deallocate(uint64_t offset, uint64_t bytes) {
 std::mutex gFlightLock;
 std::set<uint64_t> gInFlight;
 uint64_t gLastCommitted;
-struct Deferred {uint64_t offset, bytes, after;};
+// A no-copy buffer's deallocator (nmb_buffer_new_no_copy_releasing) runs with its shadow's release, once no command buffer uses it.
+struct Release {
+    void (*function)(void *context, void *pointer, uint64_t length);
+    void *context, *pointer;
+    uint64_t length;
+    void operator()() const {if (function) function(context, pointer, length);}
+};
+struct Deferred {uint64_t offset, bytes, after; Release release;};
 std::vector<Deferred> gDeferred;
-void deallocateLater(uint64_t offset, uint64_t bytes) {
+void deallocateLater(uint64_t offset, uint64_t bytes, Release release = {}) {
     {
         std::lock_guard<std::mutex> lock(gFlightLock);
-        if (!gInFlight.empty() && *gInFlight.begin() <= gLastCommitted) {gDeferred.push_back({offset, bytes, gLastCommitted}); return;}
+        if (!gInFlight.empty() && *gInFlight.begin() <= gLastCommitted) {
+            gDeferred.push_back({offset, bytes, gLastCommitted, release});
+            return;
+        }
     }
     deallocate(offset, bytes);
+    release();
 }
 void collectDeferred() {
     std::vector<Deferred> ready;
@@ -112,7 +131,10 @@ void collectDeferred() {
             else i++;
         }
     }
-    for (const Deferred &d : ready) deallocate(d.offset, d.bytes);
+    for (const Deferred &d : ready) {
+        deallocate(d.offset, d.bytes);
+        d.release();
+    }
 }
 
 // ---- requests ----
@@ -129,6 +151,7 @@ bool sendLocked(uint32_t op, const void *payload, size_t bytes, Reply &reply) {
     if (bytes) memcpy(gWindow + QM_REQUEST + sizeof header, payload, bytes);
     const uint64_t number = ++gRequestNumber;
     store(&control()->request, number);
+    ring();
     const uint64_t began = nowMs();
     for (unsigned round = 0; load(&control()->reply) != number; round++) {
         pause(round);
@@ -194,6 +217,7 @@ struct NmbBuffer {
     uint64_t offset = 0, length = 0, allocation = 0;
     void *guest = nullptr;                     // newBufferWithBytesNoCopy / an IOSurface: the caller's memory; offset is its shadow
     NmbHeap *heap = nullptr;
+    Release release = {};                      // the caller's deallocator for guest
 };
 struct NmbTexture {
     uint64_t handle = 0;
@@ -499,6 +523,11 @@ extern "C" void qemu_metal_set_window(void *base, uint64_t bytes) {
     gWindowBytes = bytes;
 }
 
+extern "C" void qemu_metal_set_doorbell(volatile void *doorbell, unsigned slot) {
+    gSlotNumber = slot;
+    gDoorbell = static_cast<volatile uint32_t *>(doorbell);
+}
+
 // A line into the window's log ring, which qemu-metal-host copies into its log: the guest process's own view (the plugin, missing
 // selectors, refusals) without a way into the guest. A line that does not fit in what the host has not read yet is dropped.
 extern "C" void qemu_metal_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
@@ -735,10 +764,16 @@ NmbBuffer *nmb_buffer_new_no_copy(NmbDevice *, void *pointer, uint64_t length, u
     buffer->guest = pointer;
     return buffer;
 }
+NmbBuffer *nmb_buffer_new_no_copy_releasing(NmbDevice *device, void *pointer, uint64_t length, uint64_t options,
+                                            void (*release)(void *context, void *pointer, uint64_t length), void *context) {
+    NmbBuffer *buffer = nmb_buffer_new_no_copy(device, pointer, length, options);
+    if (buffer) buffer->release = {release, context, pointer, length};
+    return buffer;
+}
 void nmb_buffer_release(NmbBuffer *buffer) {
     if (!buffer) return;
     if (buffer->heap) buffer->heap->used -= align(buffer->allocation, QM_HEAP_ALIGNMENT);
-    deallocateLater(buffer->offset, buffer->allocation);
+    deallocateLater(buffer->offset, buffer->allocation, buffer->release);
     delete buffer;
 }
 void *nmb_buffer_contents(const NmbBuffer *buffer) {return buffer ? (buffer->guest ? buffer->guest : gWindow + buffer->offset) : nullptr;}
@@ -805,6 +840,13 @@ static NmbTexture *textureOnBuffer(NmbBuffer *buffer, const struct NmbTextureDes
 NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *buffer, const struct NmbTextureDescriptor *descriptor, uint64_t offset, uint64_t bytes_per_row,
                                       bool iosurface) {
     return textureOnBuffer(buffer, descriptor, offset, bytes_per_row, 0, iosurface);
+}
+// Planar IOSurfaces (video, camera) have no shadow layout on the wire yet; the frontend reports the refusal.
+NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t, uint64_t, uint32_t pixel_format,
+                                       uint64_t plane, uint64_t, uint64_t, uint64_t, uint64_t) {
+    char why[96];
+    snprintf(why, sizeof why, "planar IOSurface %08x plane %llu is not forwarded", pixel_format, (unsigned long long)plane);
+    return refuse<NmbTexture>(why);
 }
 NmbTexture *nmb_texture_new_linear(NmbBuffer *buffer, const struct NmbTextureDescriptor *descriptor, uint64_t offset, uint64_t bytes_per_row,
                                    uint64_t bytes_per_image) {

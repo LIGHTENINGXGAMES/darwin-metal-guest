@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-// The Metal plugin the original discovery loads from /System/Library/Extensions/QemuMetal.bundle (the addon mount) for
-// QemuMetalAccelerator.cpp's accelerator: IOServiceMatching("IOAcceleratorES") -> MetalPluginName -> MetalPluginClassName ->
-// initWithAcceleratorPort:. In the render server (backboardd) it opens the accelerator, maps its slot of the window to the Mac write-back
-// cacheable, and returns NativeMetal's frontend over QemuMetalRemote.cpp, which the discovery registers; CARenderServer then renders the
-// system UI on the Mac's GPU. A process the kernel published a grant for (QemuMetalGrant, run-qemu.py --metal-clients) opens that grant
-// instead, which its sandbox would otherwise refuse, and gets a device of its own the same way, in a slot of its own; every other process
-// gets nil and keeps the software renderer.
+// Adapted from UniXNU-qemu's QemuMetalPlugin.mm for the darwin machine (include/darwin_metal.h).
+//
+// The Metal plugin the original discovery loads from /System/Library/Extensions/QemuMetal.bundle for the kernel's accelerator:
+// IOServiceMatching("IOAcceleratorES") -> MetalPluginName -> MetalPluginClassName -> initWithAcceleratorPort:. In the render server
+// (backboardd) it opens the accelerator, maps its slot of the window (memory type 0) and the transport's register page (type 1), and
+// returns NativeMetal's frontend over QemuMetalRemote.cpp, which the discovery registers. A process the kernel published a grant for
+// (QemuMetalGrant) opens that grant instead and gets a device of its own in a slot of its own; every other process gets nil and keeps
+// the software renderer. So does every process while no host process serves the window.
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #include <dlfcn.h>
@@ -13,8 +14,10 @@
 #include <pthread.h>
 #include <unistd.h>
 #include "NativeBridgeMetalFrontend.h"
+#include "darwin_metal.h"
 
 extern "C" void qemu_metal_set_window(void *base, uint64_t bytes);
+extern "C" void qemu_metal_set_doorbell(volatile void *doorbell, unsigned slot);
 extern "C" void qemu_metal_add_libraries(Class device);
 extern "C" void qemu_metal_answer_gaps(Class cls);
 extern "C" void qemu_metal_complete_frontend(void *device);
@@ -27,8 +30,11 @@ extern "C" void qemu_metal_log(const char *format, ...) __attribute__((format(pr
 @end
 
 namespace {
-constexpr uint32_t kOpenType = 0x514d;          // QemuMetalAccelerator.cpp
-constexpr uint32_t kMapAnywhere = 0x1, kMapCopybackCache = 0x300;
+constexpr uint32_t kOpenType = 0x514d;          // 'QM', the kernel accelerator's connection type
+constexpr uint32_t kSlotMemory = 0, kRegisterMemory = 1;
+// IOKit's kIOMapAnywhere, kIOMapInhibitCache and kIOMapWriteCombineCache. The window lies outside DRAM, so the slot is mapped
+// write-combined (normal, uncached memory: unaligned accesses are allowed) and the registers as device memory.
+constexpr uint32_t kMapAnywhere = 0x1, kMapInhibitCache = 0x100, kMapWriteCombineCache = 0x400;
 using OpenFn = kern_return_t (*)(mach_port_t, task_port_t, uint32_t, mach_port_t *);
 using MapFn = kern_return_t (*)(mach_port_t, uint32_t, task_port_t, mach_vm_address_t *, mach_vm_size_t *, uint32_t);
 using RetainFn = kern_return_t (*)(mach_port_t);
@@ -66,6 +72,26 @@ mach_port_t service(void *iokit, unsigned accelerator) {
     return found;
 }
 
+// The kernel's record at the slot's start names the slot; the register page says whether a host serves the window.
+bool attach(void *slotBase, uint64_t slotBytes, volatile uint32_t *registers, unsigned *slot) {
+    if (registers[DARWIN_METAL_ID_REGISTER / 4] != DARWIN_METAL_CONTROL_ID ||
+        registers[DARWIN_METAL_VERSION_REGISTER / 4] != DARWIN_METAL_CONTROL_VERSION) {
+        NSLog(@"QemuMetal: the register page is not the darwin machine's");
+        return false;
+    }
+    const darwin_metal_slot_record record = *static_cast<const volatile darwin_metal_slot_record *>(slotBase);
+    if (record.magic != DARWIN_METAL_SLOT_MAGIC || record.slot >= DARWIN_METAL_SLOTS || record.bytes != slotBytes) {
+        NSLog(@"QemuMetal: no slot record from the kernel");
+        return false;
+    }
+    if (registers[DARWIN_METAL_HOST_REGISTER / 4] != DARWIN_METAL_HOST_SERVING) {
+        NSLog(@"QemuMetal: no host process serves the window; keeping the software renderer");
+        return false;
+    }
+    *slot = record.slot;
+    return true;
+}
+
 id open(unsigned port) {
     void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL);
     auto serviceOpen = iokit ? (OpenFn)dlsym(iokit, "IOServiceOpen") : nullptr;
@@ -79,15 +105,23 @@ id open(unsigned port) {
     retain(port);
     mach_port_t connection = MACH_PORT_NULL;
     if (serviceOpen(target, mach_task_self(), kOpenType, &connection) != KERN_SUCCESS) return nil;
-    mach_vm_address_t address = 0;
-    mach_vm_size_t size = 0;
-    if (map(connection, 0, mach_task_self(), &address, &size, kMapAnywhere | kMapCopybackCache) != KERN_SUCCESS || !address) return nil;
+    mach_vm_address_t address = 0, registers = 0;
+    mach_vm_size_t size = 0, registerSize = 0;
+    if (map(connection, kSlotMemory, mach_task_self(), &address, &size, kMapAnywhere | kMapWriteCombineCache) != KERN_SUCCESS || !address)
+        return nil;
+    if (map(connection, kRegisterMemory, mach_task_self(), &registers, &registerSize, kMapAnywhere | kMapInhibitCache) != KERN_SUCCESS ||
+        !registers || registerSize < DARWIN_METAL_CONTROL_BYTES)
+        return nil;
+    auto page = reinterpret_cast<volatile uint32_t *>(registers);
+    unsigned slot = 0;
+    if (!attach(reinterpret_cast<void *>(address), size, page, &slot)) return nil;
     qemu_metal_set_window(reinterpret_cast<void *>(address), size);
-    qemu_metal_log("%s[%d]: window of %llu MiB at %llx", getprogname(), getpid(), (unsigned long long)(size >> 20), (unsigned long long)address);
+    qemu_metal_set_doorbell(page + DARWIN_METAL_DOORBELL_REGISTER / 4, slot);
+    qemu_metal_log("%s[%d]: slot %u, window of %llu MiB at %llx", getprogname(), getpid(), slot, (unsigned long long)(size >> 20),
+                   (unsigned long long)address);
     uint64_t registryID = 0;
     entryID(port, &registryID);
-    // The display driver takes plain 8-bit rows (NativeLegacyDisplay): no compressed or 10-bit framebuffer, as on sheng
-    // (NativeAdrenoMetalPlugin.mm); the Data seed carries the same preferences for the process's start (build-qemu-metal.py seed).
+    // The display adapter takes plain 8-bit rows (the CLCD2 software framebuffer): no compressed or 10-bit framebuffer.
     setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
     CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
     CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
@@ -104,7 +138,7 @@ id open(unsigned port) {
     qemu_metal_answer_gaps(object_getClass(device));
     if (Class objects = objc_getClass("NBObject")) qemu_metal_answer_gaps(objects);
     qemu_metal_log("device %s registered for %s", [device name].UTF8String, getprogname());
-    // The frontend's counters and its last refusals, every ten seconds, into the Mac's log.
+    // The frontend's counters and its last refusals, every ten seconds, into the host's log.
     pthread_t monitor;
     pthread_create(&monitor, nullptr, [](void *) -> void * {
         pthread_setname_np("qemu-metal status");
