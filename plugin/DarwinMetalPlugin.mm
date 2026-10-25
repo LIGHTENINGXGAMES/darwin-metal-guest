@@ -32,9 +32,9 @@ extern "C" void qemu_metal_log(const char *format, ...) __attribute__((format(pr
 namespace {
 constexpr uint32_t kOpenType = 0x514d;          // 'QM', the kernel accelerator's connection type
 constexpr uint32_t kSlotMemory = 0, kRegisterMemory = 1;
-// IOKit's kIOMapAnywhere, kIOMapInhibitCache and kIOMapWriteCombineCache. The window lies outside DRAM, so the slot is mapped
-// write-combined (normal, uncached memory: unaligned accesses are allowed) and the registers as device memory.
-constexpr uint32_t kMapAnywhere = 0x1, kMapInhibitCache = 0x100, kMapWriteCombineCache = 0x400;
+// Copyback gives Normal memory even outside DRAM; WriteCombine there becomes Device GRE on arm64 and faults on unaligned SIMD.
+// Registers remain device memory.
+constexpr uint32_t kMapAnywhere = 0x1, kMapInhibitCache = 0x100, kMapCopybackCache = 0x300;
 using OpenFn = kern_return_t (*)(mach_port_t, task_port_t, uint32_t, mach_port_t *);
 using MapFn = kern_return_t (*)(mach_port_t, uint32_t, task_port_t, mach_vm_address_t *, mach_vm_size_t *, uint32_t);
 using RetainFn = kern_return_t (*)(mach_port_t);
@@ -110,7 +110,7 @@ id open(unsigned port) {
     if (serviceOpen(target, mach_task_self(), kOpenType, &connection) != KERN_SUCCESS) return nil;
     mach_vm_address_t address = 0, registers = 0;
     mach_vm_size_t size = 0, registerSize = 0;
-    if (map(connection, kSlotMemory, mach_task_self(), &address, &size, kMapAnywhere | kMapWriteCombineCache) != KERN_SUCCESS || !address)
+    if (map(connection, kSlotMemory, mach_task_self(), &address, &size, kMapAnywhere | kMapCopybackCache) != KERN_SUCCESS || !address)
         return nil;
     if (map(connection, kRegisterMemory, mach_task_self(), &registers, &registerSize, kMapAnywhere | kMapInhibitCache) != KERN_SUCCESS ||
         !registers || registerSize < DARWIN_METAL_CONTROL_BYTES)

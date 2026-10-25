@@ -411,9 +411,6 @@ const std::pair<const char *, uint32_t> kArgumentQueries[] = {
     {"supportsFamily:", NMB_ANSWER_FLAG_ARG}, {"supportsPrimitiveType:", NMB_ANSWER_FLAG_ARG},
     {"supportsTextureWriteRoundingMode:", NMB_ANSWER_FLAG_ARG},
 };
-// The target hardware's families (iPad7,1, A10X: Apple3 and below), as the bridge answers them: Core Image's Metal context needs Apple2,
-// QuartzCore splits its frames into small command buffers where Apple3 is false.
-bool targetFamily(uint64_t family) {return family == 1001 || family == 1002 || family == 1003 || family == 3001 || family == 3002;}
 void askAnswers(NmbDevice *device) {
     std::set<std::string> flags(std::begin(kFlags), std::end(kFlags)), notCounts(std::begin(kNotCounts), std::end(kNotCounts));
     // The memory this process's GPU work has is its slot's heap, not the Mac's: Core Image sizes its caches from these.
@@ -698,12 +695,6 @@ bool nmb_device_answer(const NmbDevice *device, const char *selector, uint64_t a
     NmbDevice *d = const_cast<NmbDevice *>(device);
     auto known = d->answers.find(selector);
     if (known != d->answers.end()) {*out = known->second; return true;}
-#if TARGET_OS_IPHONE
-    if (!strcmp(selector, "supportsFamily:")) {*out = targetFamily(arg); return true;}
-#else
-    // The host instruments run this Mac's own QuartzCore, which asks for this Mac's families.
-    if (!strcmp(selector, "supportsFamily:") && targetFamily(arg)) {*out = 1; return true;}
-#endif
     {
         std::lock_guard<std::mutex> lock(d->answerLock);
         auto cached = d->argumentAnswers.find({selector, arg});
@@ -723,7 +714,8 @@ size_t nmb_device_vendor_name(const NmbDevice *device, char *out, size_t size) {
     return device ? (size_t)snprintf(out, size, "%s", device->info.vendor) : 0;
 }
 size_t nmb_device_family_waivers(const NmbDevice *, char *out, size_t size) {
-    return (size_t)snprintf(out, size, "Apple1 0:\nApple2 0:\nApple3 0:\nCommon1 0:\nCommon2 0:\n");
+    if (size) *out = 0;
+    return 0;
 }
 uint64_t nmb_device_linear_bytes_per_row(const NmbDevice *, uint64_t format, uint64_t width) {
     const QMHandleValue request = {format, width};

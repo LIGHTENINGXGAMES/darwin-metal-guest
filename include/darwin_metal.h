@@ -49,10 +49,15 @@ enum darwin_metal_host {
  * rings the doorbell with its slot number after each request.
  */
 #define DARWIN_METAL_SLOT_MAGIC UINT32_C(0x4c534d51) /* "QMSL" */
+/* Kernel/host lease extension. The original 32 bytes and QemuMetalWire are unchanged. */
+#define DARWIN_METAL_LEASE_BUSY UINT64_C(1)
+#define DARWIN_METAL_LEASE_RETIRED UINT64_C(2)
+#define DARWIN_METAL_LEASE_STEP UINT64_C(4)
 struct darwin_metal_slot_record {
     uint32_t magic, slot;
     uint64_t offset, bytes;      /* the slot within the window */
     uint64_t window_bytes;
+    uint64_t lease;
 };
 
 /*

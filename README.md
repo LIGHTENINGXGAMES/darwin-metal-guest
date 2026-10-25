@@ -21,13 +21,15 @@ backboardd -> Metal discovery -> QemuMetal.bundle (plugin/DarwinMetalPlugin.mm)
 
 The protocol inside each slot is UniXNU-qemu's `wire/QemuMetalWire.h`, unchanged. The darwin machine adds a register page with a
 doorbell and a host-presence register; the kernel writes a slot record (`struct darwin_metal_slot_record`) at the start of each slot it
-maps. Without a serving host the plugin returns nil and the process keeps the software renderer.
+maps. The slot uses Copyback (Normal memory); WriteCombine outside DRAM becomes Device memory on arm64 and cannot serve the bridge's
+unaligned SIMD accesses. The appended kernel/host lease protects slot reuse during host writeback. Without a serving host the plugin
+returns nil and the process keeps the software renderer.
 
 ## Sources
 
 | Directory | Origin | License |
 | --- | --- | --- |
-| `frontend/` | [UniXNU/AdrenoMetal](https://github.com/UniXNU/AdrenoMetal) 454ff2c, unchanged | MIT |
+| `frontend/` | adapted from [UniXNU/AdrenoMetal](https://github.com/UniXNU/AdrenoMetal) 454ff2c | MIT |
 | `wire/`, `remote/` | [xVanTuring/UniXNU-qemu](https://github.com/xVanTuring/UniXNU-qemu) 97b75b1 `package/QemuMetal` | BSD-2-Clause-Patent |
 | `plugin/` | adapted from UniXNU-qemu's `QemuMetalPlugin.mm` | BSD-2-Clause-Patent |
 | `include/darwin_metal.h` | copy of the darwin machine's `qemu-sptm/include/hw/arm/darwin_metal.h` (interface constants and layouts) | as in that tree |
@@ -37,8 +39,11 @@ The first commit holds the upstream files verbatim; later commits are the darwin
 
 - `remote/QemuMetalRemote.cpp`: rings the doorbell after each request; implements the two bridge entry points newer than UniXNU-qemu
   (`nmb_buffer_new_no_copy_releasing`, and `nmb_texture_new_on_surface`, which refuses planar surfaces for now).
-- `plugin/DarwinMetalPlugin.mm`: maps the slot write-combined and the register page uncached, reads the kernel's slot record, and
+- `plugin/DarwinMetalPlugin.mm`: maps the slot copyback and the register page uncached, reads the kernel's slot record, and
   checks that a host serves the window before it opens a device.
+- The dynamic device subclass uses the current OS's runtime layout without reading private base ivars. Family and unified-memory
+  queries come from the host, and reported shared memory is bounded by the slot heap.
+- `guest-metal-check` is signed with only the `AGXDeviceUserClient` class entitlement required by the native IOKit sandbox.
 
 ## Build locally
 

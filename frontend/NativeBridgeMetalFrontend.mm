@@ -1265,16 +1265,15 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 - (NSString *)name {return gName;}
 - (uint64_t)registryID {return gRegistryID;}
 - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
-- (BOOL)hasUnifiedMemory {return YES;}
-// Core Image's CIMetalDeviceGetLimits reads both (Apple's GPU devices answer them; _MTLDevice does not): without them every CIContext
-// creation threw and iconservicesagent aborted while rasterizing symbol glyphs. The GPU has no memory of its own; it shares the system's.
+- (BOOL)hasUnifiedMemory {uint64_t value=0;return nmb_device_answer(gDevice,"hasUnifiedMemory",0,&value)&&value;}
+// Core Image reads both. The virtual device's CPU-visible memory is limited to
+// its slot heap rather than the guest's total physical memory.
 - (uint64_t)dedicatedMemorySize {return 0;}
-- (uint64_t)sharedMemorySize {return [NSProcessInfo processInfo].physicalMemory;}
+- (uint64_t)sharedMemorySize {uint64_t value=0;return nmb_device_answer(gDevice,"sharedMemorySize",0,&value)?value:0;}
 - (BOOL)isLowPower {return NO;}
 - (BOOL)isRemovable {return NO;}
 - (BOOL)isHeadless {return NO;}
-// supportsFamily: and the other queries the runtime answers are installed from it (installAnswers); supportsFamily: also answers the target
-// hardware's families (the bridge's TARGET_FAMILIES, journaled with their waived rows as F lines). No legacy feature set is claimed: the
+// supportsFamily: and the other queries the runtime answers are installed from it (installAnswers). No legacy feature set is claimed: the
 // base implementation reads Apple tables this device does not have.
 - (BOOL)supportsFeatureSet:(MTLFeatureSet)set {(void)set;return NO;}
 // The original discovery (_MTLAddDevice) runs these four on every device it registers. The target's own versions fill the base class's limits
@@ -1556,8 +1555,9 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(getenv("NMB_DEVICE_BASE_NSOBJECT"))base=[NSObject class];
 #endif
 #if TARGET_OS_IPHONE
- // The target's base class ABI (iPadOS 17.7.11): the dynamic subclass adds no instance variables.
- if(!base || class_getInstanceSize(base)!=536){NBLOG(@"native-metal: unexpected _MTLDevice ABI");return nil;}
+ // The Objective-C runtime allocates the current OS's base layout. This
+ // subclass adds no ivars and none of its methods accesses private base ivars.
+ if(!base){NBLOG(@"native-metal: _MTLDevice is unavailable");return nil;}
 #endif
  if(!base)base=[NSObject class];
  Class cls=objc_allocateClassPair(base,"NativeBridgeMetalDevice",0);if(!cls)return nil;

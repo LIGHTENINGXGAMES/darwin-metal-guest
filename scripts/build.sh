@@ -40,7 +40,8 @@ xcrun clang++ $IOS $CXXFLAGS -fobjc-arc tools/guest-metal-check.mm -framework Fo
 
 # The guest's kernel checks 4 KiB code pages; both are added to its trust cache by CDHash.
 codesign --force --sign - --pagesize 4096 --identifier org.lstudio.QemuMetal "$OUT/QemuMetal.bundle"
-codesign --force --sign - --pagesize 4096 --identifier org.lstudio.guest-metal-check "$OUT/guest-metal-check"
+codesign --force --sign - --pagesize 4096 --identifier org.lstudio.guest-metal-check \
+    --entitlements "$ROOT/tools/guest-metal-check.entitlements.plist" "$OUT/guest-metal-check"
 cdhash() {
     detail=$(codesign --display --verbose=4 "$1" 2>&1)
     echo "$detail" | grep -q '^Page size=4096$' || { echo "$1: not signed with 4 KiB pages" >&2; exit 1; }
